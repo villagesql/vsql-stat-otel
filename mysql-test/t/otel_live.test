@@ -1,0 +1,59 @@
+# =============================================================================
+# otel_live.test -- vsql_stat_otel against a REAL OTel Collector (skip-gated)
+#
+# Proves genuine interop that otel.test cannot: the reference OpenTelemetry
+# Collector RECEIVES the OTLP/HTTP+JSON body, VALIDATES it (a malformed body is
+# rejected with a 400, which would make the flush error), and writes it out via
+# its file exporter -- which we read back to confirm the query text round-trips.
+#
+# Runs only when VSQL_STAT_OTEL_ENDPOINT points at a reachable collector
+# (e.g. http://127.0.0.1:4318) whose file exporter writes to
+# VSQL_STAT_OTEL_OUTFILE. When unset the test skips, so the default suite stays
+# hermetic and can never hang. test.sh auto-detects a local collector and sets
+# both vars; see test/otel-collector-config.yaml for the collector config.
+# =============================================================================
+
+--source include/not_windows.inc
+
+# Skip BEFORE touching any state (no temp file -- a leftover file would trip
+# MTR's check-testcase on the skip path). mysqltest expands $ENVVAR directly.
+if (!$VSQL_STAT_OTEL_ENDPOINT) {
+  --skip VSQL_STAT_OTEL_ENDPOINT not set: skipping live OTLP test
+}
+if (!$VSQL_STAT_OTEL_OUTFILE) {
+  --skip VSQL_STAT_OTEL_OUTFILE not set: skipping live OTLP test
+}
+--let $otel_ep = $VSQL_STAT_OTEL_ENDPOINT
+--let $otel_out = $VSQL_STAT_OTEL_OUTFILE
+
+--echo # Install and point the OTLP sink at the live collector.
+INSTALL EXTENSION vsql_stat_otel;
+
+--disable_query_log
+eval SET GLOBAL vsql_stat_otel.otlp_endpoint = '$otel_ep';
+SET GLOBAL vsql_stat_otel.flush_interval_ms = 100;
+SET GLOBAL vsql_stat_otel.http_timeout_secs = 5;
+SET GLOBAL vsql_stat_otel.batch_max = 1;
+SET GLOBAL vsql_stat_otel.enabled = ON;
+--enable_query_log
+
+--echo # Run a query with a unique marker; the hook captures it and the worker
+--echo # POSTs it to the collector, which writes it to its file exporter.
+SELECT 'vsql_stat_otel_live_marker' AS marker;
+
+--echo # Wait until the worker reports it archived at least one event.
+--let $wait_timeout = 20
+--let $wait_condition = SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_stat_otel.events_archived'
+--source include/wait_condition.inc
+
+--echo # No flush errors: the collector accepted the OTLP body as conformant.
+SELECT VARIABLE_VALUE = 0 AS no_flush_errors
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_stat_otel.flush_errors';
+
+--echo # The marker round-tripped through the collector's file exporter.
+--exec sh -c "for i in \$(seq 1 40); do grep -q vsql_stat_otel_live_marker '$otel_out' && break; sleep 0.5; done; grep -c vsql_stat_otel_live_marker '$otel_out'; true"
+
+--echo # Disable and uninstall cleanly.
+SET GLOBAL vsql_stat_otel.enabled = OFF;
+UNINSTALL EXTENSION vsql_stat_otel;

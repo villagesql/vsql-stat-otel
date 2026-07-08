@@ -1,0 +1,54 @@
+# Install the extension.
+INSTALL EXTENSION vsql_stat_otel;
+# Sysvars registered (defaults).
+SHOW VARIABLES LIKE 'vsql_stat_otel.%';
+Variable_name	Value
+vsql_stat_otel.batch_max	1000
+vsql_stat_otel.enabled	OFF
+vsql_stat_otel.flush_interval_ms	1000
+vsql_stat_otel.http_timeout_secs	10
+vsql_stat_otel.otlp_endpoint	http://localhost:4318
+vsql_stat_otel.queue_capacity	100000
+vsql_stat_otel.service_name	villagesql
+vsql_stat_otel.statement_max_bytes	4096
+# Point at the in-test receiver and enable capture with a short flush
+# interval so the worker exports quickly.
+# Run a query; the POSTEXECUTE hook captures it.
+SELECT 'vsql_stat_otel_marker' AS marker;
+marker
+vsql_stat_otel_marker
+# events_captured advances (capture works).
+SELECT VARIABLE_VALUE > 0 AS events_captured_positive
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_stat_otel.events_captured';
+events_captured_positive
+1
+# The worker exported the batch and the receiver returned 200, so
+# events_archived advances -- hook -> queue -> worker -> POST fired.
+SELECT VARIABLE_VALUE > 0 AS events_archived_positive
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_stat_otel.events_archived';
+events_archived_positive
+1
+# Wait until the receiver has captured a body containing the marker
+# (the first flush is not necessarily the marker query), then disable so
+# no more flushes race the body assertions.
+SET GLOBAL vsql_stat_otel.enabled = OFF;
+# Captured body is well-formed OTLP/HTTP+JSON.
+# OTLP envelope present:
+1
+1
+1
+# Semantic-convention attributes present:
+1
+1
+1
+# Footgun guard: 64-bit ints are QUOTED strings (protobuf-JSON rule),
+# not bare numbers. Prove the quoted form is present and the bare form is
+# absent -- without printing any variable values (e.g. connection_id).
+# quoted intValue present (1 = yes):
+1
+# bare (unquoted) intValue absent (0 = none, as required):
+0
+# Uninstall cleanly.
+UNINSTALL EXTENSION vsql_stat_otel;

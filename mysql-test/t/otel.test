@@ -1,0 +1,127 @@
+# =============================================================================
+# otel.test -- vsql_stat_otel: install, capture, flush, and OTLP body shape
+#
+# Hermetic (no docker, no collector). A tiny in-test Python HTTP receiver stands
+# in for an OTLP collector: it accepts the POST, writes the body to a file, and
+# returns 200. The test then asserts:
+#  - the extension installs and registers its sysvars/statusvars
+#  - a query is captured and the worker POSTs an OTLP body (events_archived > 0)
+#  - the captured body is well-formed OTLP/HTTP+JSON: resourceLogs/scopeLogs/
+#    logRecords present, the semantic-convention attributes present, and -- the
+#    protobuf-JSON footgun -- 64-bit int values are QUOTED strings.
+#  - uninstall is clean
+#
+# Genuine interop against the real reference collector is covered by the
+# skip-gated otel_live.test.
+# =============================================================================
+
+--source include/not_windows.inc
+
+--let $recv_port = 14318
+--let $recv_body = $MYSQLTEST_VARDIR/tmp/otlp_body.json
+--let $recv_py = $MYSQLTEST_VARDIR/tmp/otlp_recv.py
+
+--error 0,1
+--remove_file $recv_body
+
+# A minimal self-terminating OTLP receiver. It always answers 200 (so racing
+# flushes never error), but only writes $out when the body contains the marker
+# -- the POSTEXECUTE hook captures every statement, so the first flush is not
+# necessarily the marker query; keying on the marker makes the recorded body
+# assertions deterministic regardless of flush ordering. It exits on its own
+# after a deadline so nothing leaks past the test (mysqltest's
+# exec_in_background does not track or reap the child).
+--write_file $recv_py
+import http.server, sys, time
+port = int(sys.argv[1]); out = sys.argv[2]; marker = sys.argv[3]
+deadline = time.time() + 20
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length', 0))
+        data = self.rfile.read(n)
+        if marker.encode() in data:
+            with open(out, 'wb') as f:
+                f.write(data)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', '2')
+        self.end_headers()
+        self.wfile.write(b'{}')
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(('127.0.0.1', port), H)
+srv.timeout = 0.5
+while time.time() < deadline:
+    srv.handle_request()
+EOF
+
+--exec_in_background python3 $recv_py $recv_port $recv_body vsql_stat_otel_marker
+
+--echo # Install the extension.
+INSTALL EXTENSION vsql_stat_otel;
+
+--echo # Sysvars registered (defaults).
+SHOW VARIABLES LIKE 'vsql_stat_otel.%';
+
+--echo # Point at the in-test receiver and enable capture with a short flush
+--echo # interval so the worker exports quickly.
+--disable_query_log
+--replace_result $recv_port RECV_PORT
+eval SET GLOBAL vsql_stat_otel.otlp_endpoint = 'http://127.0.0.1:$recv_port';
+SET GLOBAL vsql_stat_otel.flush_interval_ms = 100;
+SET GLOBAL vsql_stat_otel.http_timeout_secs = 5;
+SET GLOBAL vsql_stat_otel.batch_max = 1;
+SET GLOBAL vsql_stat_otel.enabled = ON;
+--enable_query_log
+
+--echo # Run a query; the POSTEXECUTE hook captures it.
+SELECT 'vsql_stat_otel_marker' AS marker;
+
+--echo # events_captured advances (capture works).
+--let $wait_timeout = 10
+--let $wait_condition = SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_stat_otel.events_captured'
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE > 0 AS events_captured_positive
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_stat_otel.events_captured';
+
+--echo # The worker exported the batch and the receiver returned 200, so
+--echo # events_archived advances -- hook -> queue -> worker -> POST fired.
+--let $wait_timeout = 15
+--let $wait_condition = SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_stat_otel.events_archived'
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE > 0 AS events_archived_positive
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_stat_otel.events_archived';
+
+--echo # Wait until the receiver has captured a body containing the marker
+--echo # (the first flush is not necessarily the marker query), then disable so
+--echo # no more flushes race the body assertions.
+--exec sh -c "for i in \$(seq 1 60); do [ -s '$recv_body' ] && break; sleep 0.25; done; true"
+SET GLOBAL vsql_stat_otel.enabled = OFF;
+
+--echo # Captured body is well-formed OTLP/HTTP+JSON.
+--echo # OTLP envelope present:
+--exec sh -c "grep -c resourceLogs $recv_body; true"
+--exec sh -c "grep -c scopeLogs $recv_body; true"
+--exec sh -c "grep -c logRecords $recv_body; true"
+
+--echo # Semantic-convention attributes present:
+--exec sh -c "grep -c 'db.query.text' $recv_body; true"
+--exec sh -c "grep -c '\"db.system\"' $recv_body; true"
+--exec sh -c "grep -c vsql_stat_otel_marker $recv_body; true"
+
+--echo # Footgun guard: 64-bit ints are QUOTED strings (protobuf-JSON rule),
+--echo # not bare numbers. Prove the quoted form is present and the bare form is
+--echo # absent -- without printing any variable values (e.g. connection_id).
+--echo # quoted intValue present (1 = yes):
+--exec sh -c "grep -Eq 'intValue\":\"[0-9]+\"' $recv_body && echo 1 || echo 0; true"
+--echo # bare (unquoted) intValue absent (0 = none, as required):
+--exec sh -c "grep -Eo 'intValue\":[0-9]' $recv_body | wc -l | tr -d ' '; true"
+
+--echo # Uninstall cleanly.
+UNINSTALL EXTENSION vsql_stat_otel;
+
+--remove_file $recv_py
+--error 0,1
+--remove_file $recv_body

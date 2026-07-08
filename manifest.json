@@ -1,0 +1,7 @@
+{
+  "name": "vsql_stat_otel",
+  "version": "0.0.1",
+  "description": "Per-query telemetry shipped as OpenTelemetry logs over OTLP/HTTP (port 4318)",
+  "author": "VillageSQL Contributors",
+  "license": "GPL-2.0"
+}

@@ -1,0 +1,28 @@
+# OpenTelemetry Collector config for the vsql-stat-otel live test.
+#
+# Receives OTLP over HTTP on :4318 and writes every received record to
+# /output/received.json (the file exporter) so the test can read the logs back
+# and assert the payload. The debug exporter also prints them to stdout.
+#
+# Run it (from the repo root) with:
+#   docker run -d --name vsql-otel -p 4318:4318 \
+#     -v "$PWD/test/otel-collector-config.yaml:/etc/otelcol/config.yaml" \
+#     -v "$PWD/otel-out:/output" \
+#     otel/opentelemetry-collector
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  file:
+    path: /output/received.json
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [file, debug]

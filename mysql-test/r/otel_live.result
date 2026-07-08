@@ -1,0 +1,19 @@
+# Install and point the OTLP sink at the live collector.
+INSTALL EXTENSION vsql_stat_otel;
+# Run a query with a unique marker; the hook captures it and the worker
+# POSTs it to the collector, which writes it to its file exporter.
+SELECT 'vsql_stat_otel_live_marker' AS marker;
+marker
+vsql_stat_otel_live_marker
+# Wait until the worker reports it archived at least one event.
+# No flush errors: the collector accepted the OTLP body as conformant.
+SELECT VARIABLE_VALUE = 0 AS no_flush_errors
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_stat_otel.flush_errors';
+no_flush_errors
+1
+# The marker round-tripped through the collector's file exporter.
+1
+# Disable and uninstall cleanly.
+SET GLOBAL vsql_stat_otel.enabled = OFF;
+UNINSTALL EXTENSION vsql_stat_otel;
