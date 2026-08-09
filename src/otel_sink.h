@@ -40,7 +40,9 @@ public:
     char **endpoint; // "http://host:4318" (empty disables sending); "/v1/logs"
                      // is appended
     char **service_name; // resource attribute service.name
-    int64_t *http_timeout_secs;
+    // long long (not int64_t) to match the sys-var backing global; see the note
+    // in extension.cc.
+    long long *http_timeout_secs;
   };
 
   explicit OtelSink(const Config &config) : config_(config) {}
